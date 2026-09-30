@@ -372,6 +372,57 @@ static void popup() {
     ui::Message(nullptr, WM_LBUTTONUP, 0, MAKELPARAM(20, 195));
     frame();
     CHECK(underlying == 0);
+    ui::Message(nullptr, WM_LBUTTONDOWN, 0, MAKELPARAM(20, 15));
+    frame();
+    ui::Message(nullptr, WM_LBUTTONUP, 0, MAKELPARAM(20, 15));
+    frame();
+    key(VK_END);
+    key(VK_RETURN);
+    frame();
+    CHECK(choice == 2 && underlying == 0);
+    frame();
+    key(VK_RETURN);
+    frame();
+    key(VK_UP);
+    key(VK_RETURN);
+    frame();
+    CHECK(choice == 1);
+    frame();
+    key(VK_RETURN);
+    frame();
+    key(VK_ESCAPE);
+    frame();
+    frame();
+    key(VK_DOWN);
+    frame();
+    CHECK(choice == 2);
+    ui::DestroyContext(context);
+}
+
+static void popup_editor() {
+    auto *context = ui::CreateContext();
+    ui::SetCurrentContext(context);
+    ui::GetIO().DisplaySize = {640, 480};
+    std::string first = "A", second = "B";
+    auto frame = [&](bool open = false) {
+        frame_begin();
+        ui::Button("Edit");
+        if (open)
+            ui::OpenPopup("editor");
+        if (ui::BeginPopup("editor", {220, 230})) {
+            ui::InputText("first", first, 200);
+            if (open)
+                ui::SetKeyboardFocusHere();
+            ui::InputText("second", second, 200);
+            ui::EndPopup();
+        }
+        frame_end();
+    };
+    frame(true);
+    key(VK_HOME);
+    ui::Message(nullptr, WM_CHAR, 'X', 0);
+    frame();
+    CHECK(first == "A" && second == "XB");
     ui::DestroyContext(context);
 }
 
@@ -382,5 +433,6 @@ int main() {
     navigation();
     nested_scroll();
     popup();
+    popup_editor();
     std::printf("%d checks passed\n", checks);
 }

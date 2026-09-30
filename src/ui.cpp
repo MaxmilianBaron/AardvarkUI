@@ -370,6 +370,12 @@ void DrawList::AddLine(Point a, Point b, Color color, float thickness) {
     if (!std::isfinite(length) || length < 0.01f)
         return;
     const float nx = -dy * thickness / (2 * length), ny = dx * thickness / (2 * length);
+    const auto bounds = clips.back();
+    if (std::max(a.x, b.x) + std::abs(nx) <= bounds.min.x ||
+        std::min(a.x, b.x) - std::abs(nx) >= bounds.max.x ||
+        std::max(a.y, b.y) + std::abs(ny) <= bounds.min.y ||
+        std::min(a.y, b.y) - std::abs(ny) >= bounds.max.y)
+        return;
     const size_t first = vertices.size();
     Vertex v[] = {{a.x + nx, a.y + ny, 0, 1, color, 0, 0},
                   {b.x + nx, b.y + ny, 0, 1, color, 0, 0},
@@ -422,6 +428,7 @@ struct KeyEvent {
 struct FocusItem {
     std::string key;
     bool text = false;
+    std::string root;
 };
 struct EditSnapshot {
     std::string value;
@@ -445,6 +452,8 @@ struct Context {
     std::vector<KeyEvent> pendingKeys, keys;
     std::vector<FocusItem> focusOrder;
     std::string focused, itemKey, popupId, scrollFocus, wheelTarget;
+    std::string popupOwner, returnFocus;
+    bool popupArrows = false;
     std::vector<std::string> scrollOrder;
     std::vector<TableState> tables;
     Point popupPosition;
@@ -504,6 +513,26 @@ void SetCurrentContext(Context *state) {
 Style &GetStyle() {
     return current->style;
 }
+void SetTheme(Theme theme) {
+    auto &style = current->style;
+    const float size = style.FontSize, spacing = style.Spacing, rounding = style.Rounding;
+    style = Style{};
+    style.FontSize = size;
+    style.Spacing = spacing;
+    style.Rounding = rounding;
+    if (theme == Theme::Dark) {
+        style.Text = RGBA(230, 237, 243);
+        style.Muted = RGBA(152, 166, 178);
+        style.Background = RGBA(23, 30, 37);
+        style.Field = RGBA(30, 40, 49);
+        style.Button = RGBA(53, 71, 86);
+        style.Hovered = RGBA(66, 89, 106);
+        style.Active = RGBA(42, 59, 73);
+        style.Accent = RGBA(64, 196, 119);
+        style.Border = RGBA(54, 68, 79);
+        style.Selection = RGBA(30, 65, 47);
+    }
+}
 Input &GetIO() {
     assert(current);
     return current->io;
@@ -520,6 +549,7 @@ void ClearInput() {
     const bool release = current->io.MouseDown[0] && GetCapture() == current->window;
     current->active.clear();
     current->focused.clear();
+    current->returnFocus.clear();
     current->pendingKeys.clear();
     current->keys.clear();
     current->highSurrogate = 0;
@@ -643,20 +673,37 @@ void NewFrame() {
     state.scrollFocus.clear();
     state.keys = std::move(state.pendingKeys);
     state.pendingKeys.clear();
+    if (!state.returnFocus.empty()) {
+        state.focused = std::move(state.returnFocus);
+        state.returnFocus.clear();
+        state.scrollFocus = state.focused;
+    }
+    if (!state.popupId.empty()) {
+        const auto root = "w" + std::to_string(state.popupId.size()) + ":" + state.popupId;
+        state.focusOrder.erase(std::remove_if(state.focusOrder.begin(), state.focusOrder.end(),
+                                              [&](const FocusItem &item) { return item.root != root; }),
+                               state.focusOrder.end());
+    }
     if (state.down)
         state.focused.clear();
     for (auto &event : state.keys) {
         if (event.key == VK_ESCAPE && !state.popupId.empty()) {
-            state.popupId.clear();
-            state.focused.clear();
+            CloseCurrentPopup();
+            state.focusOrder.clear();
         }
-        if (event.key == VK_TAB && !state.focusOrder.empty()) {
+        const bool popupNavigation =
+            state.popupArrows && !state.popupId.empty() &&
+            (event.key == VK_UP || event.key == VK_DOWN || event.key == VK_HOME || event.key == VK_END);
+        if ((event.key == VK_TAB || popupNavigation) && !state.focusOrder.empty()) {
             auto found = std::find_if(state.focusOrder.begin(), state.focusOrder.end(),
                                       [&](const FocusItem &item) { return item.key == state.focused; });
             const auto count = static_cast<int>(state.focusOrder.size());
-            int index = found == state.focusOrder.end() ? (event.shift ? 0 : -1)
+            const bool backward = event.key == VK_UP || (event.key == VK_TAB && event.shift);
+            int index = found == state.focusOrder.end() ? (backward ? 0 : -1)
                                                         : static_cast<int>(found - state.focusOrder.begin());
-            index = (index + (event.shift ? count - 1 : 1)) % count;
+            index = event.key == VK_HOME  ? 0
+                    : event.key == VK_END ? count - 1
+                                          : (index + (backward ? count - 1 : 1)) % count;
             state.focused = state.focusOrder[index].key;
             state.scrollFocus = state.focused;
         }
@@ -670,7 +717,7 @@ void NewFrame() {
         const auto key = "w" + std::to_string(state.popupId.size()) + ":" + state.popupId;
         const auto popup = state.windows.find(key);
         if (popup != state.windows.end() && !Contains(popup->second.clip, state.io.MousePos)) {
-            state.popupId.clear();
+            CloseCurrentPopup();
             state.down = false;
             state.active.clear();
         }
@@ -790,7 +837,7 @@ void EndDisabled() {
     if (!current->disabled.empty())
         current->disabled.pop_back();
 }
-bool InvisibleButton(const char *label, Point size) {
+bool InvisibleButton(const char *label, Point size, bool keyboard_focus) {
     auto &state = *current;
     auto &window = Window();
     const Point a = window.cursor, b(a.x + size.x, a.y + size.y);
@@ -803,8 +850,9 @@ bool InvisibleButton(const char *label, Point size) {
     const bool disabled = (!state.disabled.empty() && state.disabled.back()) || !state.inputEnabled ||
                           (window.flags & NoInputs) || (!state.popupId.empty() && !window.popup);
     state.itemDisabled = disabled;
-    if (!disabled && std::isfinite(size.x) && std::isfinite(size.y) && size.x > 0 && size.y > 0) {
-        state.focusOrder.push_back({key, false});
+    if (keyboard_focus && !disabled && std::isfinite(size.x) && std::isfinite(size.y) && size.x > 0 &&
+        size.y > 0) {
+        state.focusOrder.push_back({key, false, window.root});
         if (state.focusNext) {
             state.focused = key;
             state.scrollFocus = key;
@@ -815,12 +863,13 @@ bool InvisibleButton(const char *label, Point size) {
     state.itemActivated = false;
     if (state.down && state.itemHovered && (state.active.empty() || state.active == key)) {
         state.active = key;
-        state.focused = key;
+        if (keyboard_focus)
+            state.focused = key;
         state.itemActivated = true;
     }
     state.itemActive = !disabled && state.inputEnabled && state.active == key && state.io.MouseDown[0];
     bool clicked = state.up && state.active == key && state.itemHovered;
-    if (!disabled) {
+    if (!disabled && keyboard_focus) {
         for (const auto &event : state.keys)
             if ((event.target == key || (event.target.empty() && state.focused == key)) &&
                 (event.key == VK_RETURN || event.key == VK_SPACE))
@@ -850,6 +899,9 @@ bool IsItemActivated() {
 bool IsItemHovered() {
     return current->itemHovered;
 }
+bool IsItemDisabled() {
+    return current->itemDisabled;
+}
 bool IsMouseDoubleClicked(int button) {
     return current->inputEnabled && !button && current->doubleClick;
 }
@@ -865,6 +917,35 @@ void Dummy(Point size) {
     current->item = {w.cursor, {w.cursor.x + size.x, w.cursor.y + size.y}};
     w.cursor.y += size.y;
     w.maxY = std::max(w.maxY, w.cursor.y + w.scroll - w.position.y);
+}
+float GetScrollY() {
+    return Window().scroll;
+}
+void SetScrollY(float value) {
+    auto &window = Window();
+    if (!window.child || !std::isfinite(value))
+        return;
+    value = std::clamp(value, 0.0f, window.ScrollRange());
+    window.cursor.y += window.scroll - value;
+    window.scroll = value;
+}
+void SetContentHeight(float height) {
+    auto &window = Window();
+    if (!window.child || !std::isfinite(height) || height < 0 || height > 16777216)
+        return;
+    window.content = height;
+    window.maxY = height;
+    SetScrollY(window.scroll);
+}
+RowRange VisibleRows(int count, float height) {
+    const auto &window = Window();
+    if (count <= 0 || count > 1000000 || !std::isfinite(height) || height < 1 ||
+        static_cast<double>(count) * height > 16777216 || window.clip.max.y <= window.clip.min.y)
+        return {};
+    const double first = std::floor((static_cast<double>(window.clip.min.y) - window.cursor.y) / height);
+    const double last = std::ceil((static_cast<double>(window.clip.max.y) - window.cursor.y) / height);
+    return {static_cast<int>(std::clamp(first, 0.0, static_cast<double>(count))),
+            static_cast<int>(std::clamp(last, 0.0, static_cast<double>(count)))};
 }
 bool BeginChild(const char *label, Point size, int flags) {
     auto &state = *current;
@@ -912,7 +993,7 @@ void EndChild() {
         float y = top.y + travel * child.scroll / range;
         GetWindowDrawList()->AddRectFilled(top, {top.x + width, top.y + child.size.y}, state.style.Field);
         child.cursor = {top.x, y};
-        InvisibleButton("##scroll", {width, height});
+        InvisibleButton("##scroll", {width, height}, false);
         if (IsItemActive() && travel > 0) {
             child.scroll = std::clamp(child.scroll + state.io.MouseDelta.y * range / travel, 0.0f, range);
             y = top.y + travel * child.scroll / range;
@@ -1303,13 +1384,16 @@ void OpenPopup(const char *id) {
     if (!id)
         return;
     current->popupId = PopupName(id);
+    current->popupArrows = false;
+    current->popupOwner = current->itemKey;
     current->popupPosition = {current->item.min.x, current->item.max.y + 4};
     current->focused.clear();
 }
-bool BeginPopup(const char *id, Point size) {
+bool BeginPopup(const char *id, Point size, bool directional_navigation) {
     const auto name = PopupName(id);
     if (current->popupId != name)
         return false;
+    current->popupArrows = directional_navigation;
     const auto screen = GetIO().DisplaySize;
     size.x = std::min(size.x, screen.x);
     size.y = std::min(size.y, screen.y);
@@ -1331,6 +1415,8 @@ void EndPopup() {
 void CloseCurrentPopup() {
     current->popupId.clear();
     current->focused.clear();
+    current->returnFocus = current->popupOwner;
+    current->popupOwner.clear();
 }
 
 void Flush() {

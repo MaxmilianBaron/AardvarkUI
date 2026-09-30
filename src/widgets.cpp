@@ -25,13 +25,17 @@ bool Button(const char *label, Point size) {
     const bool clicked = InvisibleButton(label, size);
     const auto &style = GetStyle();
     auto *draw = GetWindowDrawList();
-    const auto color = IsItemActive() ? style.Active : IsItemHovered() ? style.Hovered : style.Button;
+    const auto color = IsItemDisabled()  ? style.Field
+                       : IsItemActive()  ? style.Active
+                       : IsItemHovered() ? style.Hovered
+                                         : style.Button;
     draw->AddRectFilled(position, {position.x + size.x, position.y + size.y}, color, style.Rounding);
     FocusOutline(position, size);
     const auto text = GetFont()->MeasureText(label, style.FontSize);
     draw->PushClipRect({position.x + 6, position.y}, {position.x + size.x - 6, position.y + size.y});
     draw->AddText(GetFont(), style.FontSize,
-                  {position.x + (size.x - text.x) / 2, position.y + (size.y - text.y) / 2}, White, label);
+                  {position.x + (size.x - text.x) / 2, position.y + (size.y - text.y) / 2},
+                  IsItemDisabled() ? style.Muted : White, label);
     draw->PopClipRect();
     return clicked;
 }
@@ -173,7 +177,7 @@ bool Combo(const char *label, int &selected, const char *const *items, int count
     }
     if (opened)
         OpenPopup("items");
-    if (BeginPopup("items", {width, std::min(count * 34.0f + 12, 284.0f)})) {
+    if (BeginPopup("items", {width, std::min(count * 34.0f + 12, 284.0f)}, true)) {
         const auto size = GetWindowSize();
         const auto top = GetCursorScreenPos();
         SetCursorScreenPos({top.x + 6, top.y + 6});

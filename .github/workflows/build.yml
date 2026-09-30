@@ -8,18 +8,22 @@ jobs:
     strategy:
       matrix:
         arch: [Win32, x64]
+        config: [Debug, Release]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - run: cmake -S . -B build -A ${{ matrix.arch }}
-      - run: cmake --build build --config Release
-      - run: ctest --test-dir build -C Release --output-on-failure
-      - run: cmake --install build --config Release --prefix package
+      - run: cmake --build build --config ${{ matrix.config }}
+      - run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+      - run: cmake --install build --config ${{ matrix.config }} --prefix package
+      - run: cmake -S tests/consumer -B consumer -A ${{ matrix.arch }} -DCMAKE_PREFIX_PATH="${{ github.workspace }}/package"
+      - run: cmake --build consumer --config ${{ matrix.config }}
+      - run: ctest --test-dir consumer -C ${{ matrix.config }} --output-on-failure
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: AardvarkUI-${{ matrix.arch }}
+          name: AardvarkUI-${{ matrix.arch }}-${{ matrix.config }}
           if-no-files-found: error
           path: |
             package/
-            build/Release/aardvark_ui_demo.exe
+            build/${{ matrix.config }}/aardvark_ui_demo.exe

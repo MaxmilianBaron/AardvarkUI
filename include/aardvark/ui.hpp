@@ -96,6 +96,9 @@ struct Style {
     float FontSize = 17, Spacing = 8, Rounding = 6;
 };
 
+enum class Theme { Light, Dark };
+void SetTheme(Theme);
+
 struct Context;
 constexpr int NoInputs = 1, FirstUse = 1;
 Context *CreateContext(HWND window = nullptr, IDirect3DDevice9 *device = nullptr);
@@ -139,10 +142,11 @@ Point GetCursorScreenPos();
 void SetCursorScreenPos(Point);
 Point GetItemRectMin();
 Point GetItemRectMax();
-bool InvisibleButton(const char *id, Point size);
+bool InvisibleButton(const char *id, Point size, bool keyboard_focus = true);
 bool IsItemActivated();
 bool IsItemActive();
 bool IsItemHovered();
+bool IsItemDisabled();
 bool IsWindowHovered();
 bool IsMouseHoveringRect(Point min, Point max);
 bool IsMouseDragging(int button, float threshold = 0);
@@ -152,11 +156,32 @@ void SameLine(float spacing = -1);
 void Spacing(float height = -1);
 void Separator(float width = 0);
 
+float GetScrollY();
+void SetScrollY(float);
+void SetContentHeight(float);
+struct RowRange {
+    int first = 0, last = 0;
+};
+RowRange VisibleRows(int count, float row_height);
+
+struct TableColumn {
+    const char *label = nullptr;
+    float weight = 1;
+};
+struct TableSort {
+    int column = -1;
+    bool descending = false;
+};
+enum TableEvent { SelectionChanged = 1, SortChanged = 2, ColumnResized = 4 };
+using TableCell = const char *(*)(int row, int column, void *user);
+int DataTable(const char *id, TableColumn *columns, int column_count, int row_count, int &selected,
+              TableSort &, TableCell, void *user = nullptr, Point size = {480, 300}, float row_height = 32);
+
 bool BeginTable(const char *id, int columns, float width = 0);
 void TableNextColumn();
 void EndTable();
 void OpenPopup(const char *id);
-bool BeginPopup(const char *id, Point size);
+bool BeginPopup(const char *id, Point size, bool directional_navigation = false);
 void EndPopup();
 void CloseCurrentPopup();
 
