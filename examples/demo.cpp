@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <gdiplus.h>
+#include <objidl.h>
 #include <shellapi.h>
 #include <string>
 #include <vector>
@@ -16,6 +18,10 @@ static bool resize_pending = false;
 static int clicks = 0;
 static bool chart = true;
 static float amplitude = 0.65f;
+static IDirect3DTexture9 *logo = nullptr;
+static std::string workspace = "My workspace";
+static int mode = 0, density = 0, selected_row = 0;
+static bool advanced = false, diagnostics = false;
 
 static LRESULT CALLBACK window_message(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (context)
@@ -24,7 +30,10 @@ static LRESULT CALLBACK window_message(HWND window, UINT message, WPARAM wparam,
         resize_pending = true;
     if (message == WM_GETMINMAXINFO) {
         auto *limits = reinterpret_cast<MINMAXINFO *>(lparam);
-        limits->ptMinTrackSize = {800, 640};
+        RECT minimum{0, 0, 1000, 800};
+        AdjustWindowRectEx(&minimum, static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)), FALSE,
+                           static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)));
+        limits->ptMinTrackSize = {minimum.right - minimum.left, minimum.bottom - minimum.top};
         return 0;
     }
     if (message == WM_DESTROY) {
@@ -35,10 +44,16 @@ static LRESULT CALLBACK window_message(HWND window, UINT message, WPARAM wparam,
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
-static void label(float x, float y, const char *text, float size = 18,
-                  ui::Color color = ui::RGBA(218, 225, 235)) {
+static void label(float x, float y, const char *text, float size = 17, ui::Color color = 0) {
     ui::SetCursorScreenPos({x, y});
-    ui::Text(text, size, color);
+    ui::Text(text, size, color ? color : ui::GetStyle().Text);
+}
+
+static void panel(ui::Point top, ui::Point bottom) {
+    auto *draw = ui::GetWindowDrawList();
+    draw->AddRectFilled({top.x, top.y + 2}, {bottom.x, bottom.y + 2}, ui::RGBA(228, 232, 236), 10);
+    draw->AddRectFilled(top, bottom, ui::White, 10);
+    draw->AddRect(top, bottom, ui::GetStyle().Border, 1, 10);
 }
 
 static void contents(bool snapshot) {
@@ -47,66 +62,167 @@ static void contents(bool snapshot) {
     ui::SetNextWindowSize(screen);
     ui::Begin("Demo");
     auto *draw = ui::GetWindowDrawList();
-    draw->AddRectFilled({24, 24}, {screen.x - 24, 108}, ui::RGBA(24, 31, 42));
-    draw->AddRectFilled({24, 24}, {28, 108}, ui::RGBA(101, 188, 246));
-    label(46, 36, "AardvarkUI", 32, ui::White);
-    label(47, 76, "A small immediate-mode UI for Windows", 16, ui::RGBA(150, 167, 189));
-    label(screen.x - 108, 50, "v0.1.0", 17, ui::RGBA(113, 189, 255));
-    draw->AddRectFilled({24, 128}, {384, screen.y - 62}, ui::RGBA(24, 31, 42));
-    draw->AddRectFilled({404, 128}, {screen.x - 24, screen.y - 62}, ui::RGBA(24, 31, 42));
-    label(46, 150, "Controls", 23, ui::White);
-    label(46, 185, "Click, drag and scroll.", 17, ui::RGBA(150, 167, 189));
-    ui::SetCursorScreenPos({46, 231});
-    if (ui::Button("Add a click", {316, 42}))
+    const auto &style = ui::GetStyle();
+    draw->AddImage(logo, {30, 27}, {100, 97});
+    label(122, 34, "AardvarkUI", 30);
+    label(123, 77, "A compact toolkit for native interfaces.", 15, style.Muted);
+    draw->AddRectFilled({screen.x - 154, 45}, {screen.x - 32, 77}, style.Selection, 16);
+    draw->AddCircleFilled({screen.x - 136, 61}, 4, style.Accent);
+    label(screen.x - 123, 53, "v0.2.0", 16, style.Accent);
+    draw->AddLine({32, 119}, {screen.x - 32, 119}, style.Border);
+
+    panel({32, 150}, {380, screen.y - 58});
+    panel({404, 150}, {screen.x - 32, screen.y - 58});
+    label(56, 174, "Controls", 22);
+    label(56, 209, "Click, type or press Tab.", 14, style.Muted);
+    ui::SetCursorScreenPos({56, 257});
+    ui::InputText("Workspace name", workspace, 300, 128);
+    ui::SetCursorScreenPos({56, 337});
+    const char *modes[] = {"Balanced", "Responsive", "Quiet"};
+    ui::Combo("Mode", mode, modes, 3, 300);
+    ui::SetCursorScreenPos({56, 400});
+    ui::Checkbox("Live preview", chart);
+    ui::SetCursorScreenPos({56, 450});
+    ui::SliderFloat("Intensity", amplitude, 0, 1, 300);
+    ui::SetCursorScreenPos({56, 525});
+    ui::RadioButton("Compact", density, 0);
+    ui::SameLine(24);
+    ui::RadioButton("Comfort", density, 1);
+    ui::SetCursorScreenPos({56, 567});
+    if (ui::CollapsingHeader("Options", advanced, 300)) {
+        ui::SetCursorScreenPos({66, 612});
+        ui::Checkbox("Show diagnostics", diagnostics);
+    }
+    ui::SetCursorScreenPos({56, 656});
+    if (ui::Button("Apply changes", {186, 38}))
         ++clicks;
-    char counter[48]{};
-    std::snprintf(counter, sizeof(counter), "Button clicks: %d", clicks);
-    label(46, 291, counter);
-    ui::SetCursorScreenPos({46, 343});
-    ui::Checkbox("Show chart", chart);
-    ui::SetCursorScreenPos({46, 405});
-    ui::SliderFloat("Amplitude", amplitude, 0, 1, 316);
-    label(46, 486, "No external fonts or textures.", 16, ui::RGBA(150, 167, 189));
-    label(46, 512, "Resize the window to try the layout.", 16, ui::RGBA(150, 167, 189));
-    label(428, 150, "Draw list", 23, ui::White);
-    label(428, 185, "Clipped geometry and UTF-8 text", 17, ui::RGBA(150, 167, 189));
-    const float width = screen.x - 476;
-    const ui::Point top{428, 233}, bottom{screen.x - 48, 383};
-    draw->AddRectFilled(top, bottom, ui::RGBA(15, 21, 30));
+    ui::SameLine(12);
+    if (ui::Button("Reset", {102, 38})) {
+        workspace = "My workspace";
+        mode = density = clicks = 0;
+        chart = true;
+        amplitude = 0.65f;
+    }
+    char saved[64]{};
+    std::snprintf(saved, sizeof(saved), "%s / %d saved",
+                  mode == 0   ? "Balanced"
+                  : mode == 1 ? "Responsive"
+                              : "Quiet",
+                  clicks);
+    label(56, 707, saved, 13, style.Muted);
+
+    label(428, 174, "Live canvas", 22);
+    label(428, 209, "Clipped geometry and UTF-8 text", 14, style.Muted);
+    const ui::Point top{428, 253}, bottom{screen.x - 56, 413};
+    const float width = bottom.x - top.x;
+    draw->AddRectFilled(top, bottom, ui::RGBA(247, 249, 250), 6);
     draw->PushClipRect(top, bottom);
     for (int row = 1; row < 5; ++row)
-        draw->AddLine({top.x, top.y + row * 30}, {bottom.x, top.y + row * 30}, ui::RGBA(33, 44, 59));
+        draw->AddLine({top.x, top.y + row * 32}, {bottom.x, top.y + row * 32}, ui::RGBA(230, 235, 238));
     if (chart) {
         const float phase = snapshot ? 0.7f : static_cast<float>(GetTickCount64() % 10000) / 1400;
-        ui::Point previous{top.x, top.y + 75};
-        for (int step = 0; step <= 160; ++step) {
-            const float x = static_cast<float>(step) / 160;
-            const ui::Point next{top.x + width * x, top.y + 75 - std::sin(x * 13 + phase) * amplitude * 56};
+        ui::Point previous{};
+        for (int step = 0; step <= 180; ++step) {
+            const float x = static_cast<float>(step) / 180;
+            const ui::Point next{top.x + width * x, top.y + 80 - std::sin(x * 13 + phase) * amplitude * 65};
             if (step)
-                draw->AddLine(previous, next, ui::RGBA(99, 193, 253), 2);
+                draw->AddLine(previous, next, style.Accent, 2);
             previous = next;
         }
     }
     draw->PopClipRect();
-    label(428, 409, "Scrollable child", 19, ui::White);
-    label(428, 437, "20 entries / mouse wheel", 15, ui::RGBA(150, 167, 189));
-    ui::SetCursorScreenPos({428, 467});
-    draw->AddRectFilled({428, 467}, {screen.x - 48, screen.y - 83}, ui::RGBA(15, 21, 30));
-    ui::BeginChild("Entries", {width, screen.y - 550});
-    for (int row = 0; row < 20; ++row) {
-        const auto position = ui::GetCursorScreenPos();
-        char item[80]{};
-        std::snprintf(item, sizeof(item),
-                      "Item %02d  /  P\xc5\x99\xc3\xadli\xc5\xa1 \xc5\xbelu\xc5\xa5ou\xc4\x8dk\xc3\xbd",
-                      row + 1);
-        ui::GetWindowDrawList()->AddText(ui::GetFont(), 17, {position.x + 10, position.y + 6},
-                                         ui::RGBA(185, 204, 225), item);
-        ui::Dummy({width, 32});
+    label(428, 443, "Data & selection", 20);
+    label(428, 475, "20 entries / scroll to explore", 13, style.Muted);
+    ui::SetCursorScreenPos({428, 510});
+    ui::BeginChild("Records", {width, screen.y - 610});
+    if (ui::BeginTable("records", 3, width)) {
+        for (const char *heading : {"COMPONENT", "TYPE", "STATUS"}) {
+            ui::TableNextColumn();
+            ui::Text(heading, 12, style.Muted);
+            ui::Spacing(10);
+        }
+        for (int row = 0; row < 20; ++row) {
+            char entry[48]{};
+            std::snprintf(entry, sizeof(entry), "Item %02d", row + 1);
+            ui::TableNextColumn();
+            if (ui::Selectable(entry, selected_row == row, {width / 3 - 16, density ? 40.0f : 32.0f}))
+                selected_row = row;
+            ui::TableNextColumn();
+            ui::Spacing(8);
+            ui::Text(row % 2 ? "Control" : "Surface", 14, style.Muted);
+            ui::TableNextColumn();
+            ui::Spacing(8);
+            ui::Text("Ready", 14, style.Accent);
+        }
+        ui::EndTable();
     }
     ui::EndChild();
-    label(24, screen.y - 39, "Direct3D 9  /  Win32  /  C++17", 15, ui::RGBA(123, 143, 169));
-    label(screen.x - 191, screen.y - 39, "MIT licensed", 15, ui::RGBA(123, 143, 169));
+    char renderer[96]{};
+    std::snprintf(renderer, sizeof(renderer), "%zu vertices / %zu batches", draw->vertices.size(),
+                  draw->commands.size());
+    label(428, screen.y - 85, diagnostics ? renderer : "Keyboard and mouse input enabled", 13, style.Muted);
+    label(32, screen.y - 33, "C++17 / WIN32 / DIRECT3D 9", 12, style.Muted);
+    label(screen.x - 235, screen.y - 33, "MIT / x86 + x64", 12, style.Muted);
     ui::End();
+}
+
+static bool load_logo(HINSTANCE instance) {
+    const auto resource = FindResourceW(instance, MAKEINTRESOURCEW(101), MAKEINTRESOURCEW(10));
+    if (!resource)
+        return false;
+    const auto bytes = SizeofResource(instance, resource);
+    const auto loaded = LoadResource(instance, resource);
+    auto *source = loaded ? LockResource(loaded) : nullptr;
+    if (!source)
+        return false;
+    auto memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory)
+        return false;
+    auto *destination = GlobalLock(memory);
+    if (!destination) {
+        GlobalFree(memory);
+        return false;
+    }
+    std::memcpy(destination, source, bytes);
+    GlobalUnlock(memory);
+    IStream *stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(memory, TRUE, &stream))) {
+        GlobalFree(memory);
+        return false;
+    }
+    ULONG_PTR token = 0;
+    Gdiplus::GdiplusStartupInput options;
+    bool success = Gdiplus::GdiplusStartup(&token, &options, nullptr) == Gdiplus::Ok;
+    if (success) {
+        {
+            Gdiplus::Bitmap bitmap(stream);
+            const auto width = bitmap.GetWidth(), height = bitmap.GetHeight();
+            success = bitmap.GetLastStatus() == Gdiplus::Ok && width && height && width <= 2048 &&
+                      height <= 2048 &&
+                      SUCCEEDED(device->CreateTexture(width, height, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+                                                      &logo, nullptr));
+            D3DLOCKED_RECT lock{};
+            if (success) {
+                success = SUCCEEDED(logo->LockRect(0, &lock, nullptr, 0));
+                if (success) {
+                    for (unsigned y = 0; y < height; ++y) {
+                        auto *row = reinterpret_cast<std::uint32_t *>(
+                            static_cast<unsigned char *>(lock.pBits) + y * lock.Pitch);
+                        for (unsigned x = 0; x < width; ++x) {
+                            Gdiplus::Color color;
+                            if (bitmap.GetPixel(x, y, &color) != Gdiplus::Ok)
+                                success = false;
+                            row[x] = color.GetValue();
+                        }
+                    }
+                    logo->UnlockRect(0);
+                }
+            }
+        }
+        Gdiplus::GdiplusShutdown(token);
+    }
+    stream->Release();
+    return success;
 }
 
 static bool save_image(const wchar_t *path) {
@@ -154,10 +270,41 @@ static bool save_image(const wchar_t *path) {
     return success;
 }
 
+static void snapshot_input(HWND window, int frame, bool menu) {
+    const auto click = [&](int x, int y) {
+        SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
+        SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+    };
+    const auto control = [&](WPARAM key) {
+        SendMessageW(window, WM_KEYDOWN, VK_CONTROL, 0);
+        SendMessageW(window, WM_KEYDOWN, key, 0);
+        SendMessageW(window, WM_KEYUP, key, 0);
+        SendMessageW(window, WM_KEYUP, VK_CONTROL, 0);
+    };
+    if (frame == 1)
+        click(130, 295);
+    if (frame == 2) {
+        control('A');
+        for (const wchar_t letter : std::wstring(L"Aardvark workspace"))
+            SendMessageW(window, WM_CHAR, letter, 0);
+        control('Z');
+        control('Y');
+    }
+    if (frame == 3 || (frame == 7 && menu))
+        click(130, 355);
+    if (frame == 4)
+        click(130, 435);
+    if (frame == 5)
+        click(130, 580);
+    if (frame == 6)
+        click(130, 674);
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     int argc = 0;
     auto **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    const bool snapshot = argv && argc == 3 && std::wstring(argv[1]) == L"--snapshot";
+    const bool menu = argv && argc == 3 && std::wstring(argv[1]) == L"--snapshot-menu";
+    const bool snapshot = menu || (argv && argc == 3 && std::wstring(argv[1]) == L"--snapshot");
     const std::wstring path = snapshot ? argv[2] : L"";
     if (argv)
         LocalFree(argv);
@@ -169,7 +316,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     type.lpszClassName = L"AardvarkUIDemo";
     if (!RegisterClassExW(&type))
         return 10;
-    RECT dimensions{0, 0, 960, 660};
+    RECT dimensions{0, 0, 1080, 800};
     AdjustWindowRect(&dimensions, WS_OVERLAPPEDWINDOW, FALSE);
     const auto window =
         CreateWindowW(type.lpszClassName, L"AardvarkUI", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -197,7 +344,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     context = ui::CreateContext(window, device);
     ui::SetCurrentContext(context);
-    int result = ui::LoadFont() ? 0 : 14;
+    int result = ui::LoadFont(L"Cascadia Code", 40) && load_logo(instance) ? 0 : 14;
     if (!snapshot)
         ShowWindow(window, show);
     resize_pending = false;
@@ -227,13 +374,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             }
             resize_pending = false;
         }
-        if (snapshot && frames == 1)
-            SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(100, 250));
-        if (snapshot && frames == 2)
-            SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(100, 250));
+        if (snapshot)
+            snapshot_input(window, frames, menu);
         ui::NewFrame();
         contents(snapshot);
-        device->Clear(0, nullptr, D3DCLEAR_TARGET, ui::RGBA(12, 17, 24), 1, 0);
+        device->Clear(0, nullptr, D3DCLEAR_TARGET, ui::RGBA(246, 247, 248), 1, 0);
         if (FAILED(device->BeginScene())) {
             result = 2;
             break;
@@ -245,14 +390,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (fog != TRUE)
             result = 3;
         device->EndScene();
-        if (snapshot && frames == 3) {
-            if (clicks != 1 || !save_image(path.c_str()))
+        if (snapshot && frames == 8) {
+            if (clicks != 1 || workspace != "Aardvark workspace" || mode != 1 || !advanced ||
+                !save_image(path.c_str()))
                 result = 4;
             break;
         }
         device->Present(nullptr, nullptr, nullptr, nullptr);
         ++frames;
-        if (snapshot && frames == 3) {
+        if (snapshot && frames == 8) {
             presentation.BackBufferWidth = presentation.BackBufferHeight = 0;
             if (FAILED(device->Reset(&presentation))) {
                 result = 5;
@@ -264,6 +410,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     ui::DestroyContext(context);
     context = nullptr;
+    if (logo)
+        logo->Release();
+    logo = nullptr;
     device->Release();
     device = nullptr;
     graphics->Release();

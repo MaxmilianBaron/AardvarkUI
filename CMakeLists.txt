@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(AardvarkUI VERSION 0.1.0 LANGUAGES CXX)
+project(AardvarkUI VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "AardvarkUI requires Windows and Direct3D 9.")
@@ -21,8 +21,9 @@ if(MSVC)
 endif()
 
 if(AARDVARKUI_BUILD_EXAMPLES)
-    add_executable(aardvark_ui_demo WIN32 examples/demo.cpp)
-    target_link_libraries(aardvark_ui_demo PRIVATE AardvarkUI shell32 gdiplus)
+    add_executable(aardvark_ui_demo WIN32 examples/demo.cpp examples/demo.rc)
+    target_link_libraries(aardvark_ui_demo PRIVATE AardvarkUI shell32 gdiplus ole32)
+    target_include_directories(aardvark_ui_demo PRIVATE examples)
 endif()
 if(AARDVARKUI_BUILD_TESTS)
     enable_testing()

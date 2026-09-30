@@ -1,10 +1,12 @@
 # AardvarkUI
 
-A small C++17 immediate-mode UI library for Win32 and Direct3D 9. It provides mouse-driven buttons, checkboxes, sliders, scrollable panels, UTF-8 text and clipped draw lists.
+C++17 immediate-mode UI for **Win32 and Direct3D 9, x86 and x64**. MIT licensed.
+
+Text editing with selection, clipboard and undo; keyboard navigation; buttons, sliders, checkboxes, radio buttons, combo boxes, popups, scrollable panels and equal-width tables. Draw lists batch clipped geometry, images and UTF-8 text.
 
 ![AardvarkUI demo](docs/demo.png)
 
-**Windows x86 and x64. MIT licensed.** Uses installed Windows fonts; no bundled fonts, textures or third-party libraries.
+The demo uses Cascadia Code when installed, a light theme and an embedded Aardvarkland icon. Windows substitutes a font if needed. No external library dependencies.
 
 Build with Visual Studio 2022 C++ tools, the Windows SDK and CMake 3.21 or newer:
 
@@ -15,7 +17,7 @@ ctest --test-dir build -C Release --output-on-failure
 .\build\Release\aardvark_ui_demo.exe
 ```
 
-Use `-A Win32` in a separate build directory for x86. The demo supports resizing and device reset.
+Use `-A Win32` in a separate directory for x86.
 
 Add it to another CMake project:
 
@@ -24,8 +26,4 @@ add_subdirectory(AardvarkUI)
 target_link_libraries(your_app PRIVATE AardvarkUI::AardvarkUI)
 ```
 
-Or run `cmake --install build --config Release --prefix <directory>` and use `find_package(AardvarkUI CONFIG REQUIRED)`.
-
-See the [integration guide](docs/integration.md) and [working example](examples/demo.cpp). This first version has mouse input only: no text-entry widgets, keyboard navigation, docking, accessibility adapter or text shaping. It uses classic Direct3D 9, not Direct3D 9Ex.
-
-Bug reports, focused pull requests and small examples are welcome. Include the architecture and a minimal reproduction. See [LICENSE](LICENSE) for reuse terms.
+See [integration](docs/integration.md) for installed packages, input routing and lifecycle. Classic D3D9 only; no docking, multi-viewport, accessibility adapter or complex-script shaping.

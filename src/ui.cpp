@@ -40,7 +40,7 @@ struct Font::Data {
     HGDIOBJ oldFont = nullptr, oldBitmap = nullptr;
     uint32_t *pixels = nullptr;
     float height = 64, emHeight = 64;
-    unsigned slot = 0;
+    unsigned atlasX = 0, atlasY = 0, rowHeight = 0;
     std::vector<IDirect3DTexture9 *> pages;
     std::map<uint32_t, Glyph> glyphs;
     ~Data() {
@@ -112,9 +112,13 @@ const Glyph &Font::GetGlyph(uint32_t code) {
     const auto found = data->glyphs.find(code);
     if (found != data->glyphs.end())
         return found->second;
-    if (data->glyphs.size() >= 1023 && code != 0xfffd)
+    if (data->glyphs.size() >= 4095 && code != 0xfffd)
         return GetGlyph(0xfffd);
     Glyph glyph;
+    if (!data->device) {
+        glyph.advance = data->height * 0.5f;
+        return data->glyphs.emplace(code, glyph).first->second;
+    }
     wchar_t chars[2]{};
     unsigned length = 1;
     if (code > 65535) {
@@ -129,51 +133,63 @@ const Glyph &Font::GetGlyph(uint32_t code) {
     if (!GetTextExtentPoint32W(data->dc, chars, length, &extent))
         return data->glyphs.emplace(code, glyph).first->second;
     glyph.advance = static_cast<float>(std::clamp(extent.cx, 0L, 120L));
-    const unsigned index = data->slot / 256, slot = data->slot % 256;
-    if (index >= data->pages.size()) {
+    constexpr unsigned atlasSize = 1024;
+    const unsigned glyphWidth = static_cast<unsigned>(glyph.advance) + 4;
+    const unsigned glyphHeight = static_cast<unsigned>(data->height) + 2;
+    if (data->atlasX + glyphWidth > atlasSize) {
+        data->atlasX = 0;
+        data->atlasY += data->rowHeight;
+        data->rowHeight = 0;
+    }
+    if (data->pages.empty() || data->atlasY + glyphHeight > atlasSize) {
+        if (data->pages.size() >= 16)
+            return data->glyphs.emplace(code, glyph).first->second;
         IDirect3DTexture9 *page = nullptr;
-        if (FAILED(data->device->CreateTexture(2048, 2048, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &page,
-                                               nullptr)))
+        if (FAILED(data->device->CreateTexture(atlasSize, atlasSize, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+                                               &page, nullptr)))
             return data->glyphs.emplace(code, glyph).first->second;
         D3DLOCKED_RECT lock{};
         if (FAILED(page->LockRect(0, &lock, nullptr, 0))) {
             page->Release();
             return data->glyphs.emplace(code, glyph).first->second;
         }
-        for (unsigned y = 0; y < 2048; ++y)
-            std::memset(static_cast<unsigned char *>(lock.pBits) + y * lock.Pitch, 0, 2048 * 4);
+        for (unsigned y = 0; y < atlasSize; ++y)
+            std::memset(static_cast<unsigned char *>(lock.pBits) + y * lock.Pitch, 0, atlasSize * 4);
         page->UnlockRect(0);
         const auto release = [](IDirect3DTexture9 *texture) { texture->Release(); };
         std::unique_ptr<IDirect3DTexture9, decltype(release)> owner(page, release);
         data->pages.push_back(page);
         owner.release();
+        data->atlasX = data->atlasY = data->rowHeight = 0;
     }
     std::memset(data->pixels, 0, 128 * 128 * 4);
     RECT box{0, 0, 128, 128};
     ExtTextOutW(data->dc, 2, 0, ETO_CLIPPED | ETO_OPAQUE, &box, chars, length, nullptr);
     GdiFlush();
-    const LONG x = static_cast<LONG>(slot % 16) * 128, y = static_cast<LONG>(slot / 16) * 128;
-    RECT area{x, y, x + 128, y + 128};
+    const LONG x = static_cast<LONG>(data->atlasX), y = static_cast<LONG>(data->atlasY);
+    RECT area{x, y, x + static_cast<LONG>(glyphWidth), y + static_cast<LONG>(glyphHeight)};
     D3DLOCKED_RECT lock{};
-    auto *page = data->pages[index];
+    auto *page = data->pages.back();
     if (FAILED(page->LockRect(0, &lock, &area, 0)))
         return data->glyphs.emplace(code, glyph).first->second;
-    for (unsigned row = 0; row < 128; ++row) {
+    for (unsigned row = 0; row < glyphHeight; ++row) {
         auto *target =
             reinterpret_cast<uint32_t *>(static_cast<unsigned char *>(lock.pBits) + row * lock.Pitch);
-        for (unsigned col = 0; col < 128; ++col) {
+        for (unsigned col = 0; col < glyphWidth; ++col) {
             const uint32_t pixel = data->pixels[row * 128 + col];
             const uint32_t alpha = std::max({pixel & 255, (pixel >> 8) & 255, (pixel >> 16) & 255});
             target[col] = (alpha << 24) | 0x00ffffff;
         }
     }
     page->UnlockRect(0);
-    ++data->slot;
+    data->atlasX += glyphWidth;
+    data->rowHeight = std::max(data->rowHeight, glyphHeight);
     glyph.texture = page;
     glyph.width = glyph.advance + 4;
     glyph.height = data->height;
-    glyph.uv0 = {x / 2048.0f, y / 2048.0f};
-    glyph.uv1 = {(x + glyph.width) / 2048.0f, (y + glyph.height) / 2048.0f};
+    glyph.uv0 = {x / static_cast<float>(atlasSize), y / static_cast<float>(atlasSize)};
+    glyph.uv1 = {(x + glyph.width) / static_cast<float>(atlasSize),
+                 (y + glyph.height) / static_cast<float>(atlasSize)};
     return data->glyphs.emplace(code, glyph).first->second;
 }
 
@@ -277,8 +293,73 @@ void DrawList::AddImage(Texture texture, Point a, Point b, Point uv0, Point uv1,
     else
         commands.push_back({texture, clip, first, 6});
 }
-void DrawList::AddRectFilled(Point a, Point b, Color color) {
-    AddImage(nullptr, a, b, {}, {1, 1}, color);
+void DrawList::AddRectFilled(Point a, Point b, Color color, float rounding) {
+    if (rounding <= 0 || !std::isfinite(rounding)) {
+        AddImage(nullptr, a, b, {}, {1, 1}, color);
+        return;
+    }
+    if (clips.empty() || !(color >> 24) || vertices.size() > 1000000 || !std::isfinite(a.x) ||
+        !std::isfinite(a.y) || !std::isfinite(b.x) || !std::isfinite(b.y) || b.x <= a.x || b.y <= a.y)
+        return;
+    const auto clip = clips.back();
+    if (b.x <= clip.min.x || b.y <= clip.min.y || a.x >= clip.max.x || a.y >= clip.max.y)
+        return;
+    const float radius = std::min(rounding, std::min(b.x - a.x, b.y - a.y) * 0.5f);
+    const Point centers[] = {{b.x - radius, a.y + radius},
+                             {b.x - radius, b.y - radius},
+                             {a.x + radius, b.y - radius},
+                             {a.x + radius, a.y + radius}};
+    std::array<Point, 36> border{};
+    std::size_t count = 0;
+    for (int corner = 0; corner < 4; ++corner)
+        for (int i = 0; i <= 8; ++i) {
+            const float angle = (corner - 1 + i / 8.0f) * 1.570796327f;
+            border[count++] = {centers[corner].x + std::cos(angle) * radius,
+                               centers[corner].y + std::sin(angle) * radius};
+        }
+    const std::size_t first = vertices.size();
+    const Point center{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
+    for (std::size_t i = 0; i < count; ++i)
+        for (Point point : {center, border[i], border[(i + 1) % count]})
+            vertices.push_back({point.x - 0.5f, point.y - 0.5f, 0, 1, color, 0, 0});
+    if (!commands.empty() && !commands.back().texture &&
+        std::memcmp(&commands.back().clip, &clip, sizeof(clip)) == 0)
+        commands.back().count += vertices.size() - first;
+    else
+        commands.push_back({nullptr, clip, first, vertices.size() - first});
+}
+void DrawList::AddRect(Point a, Point b, Color color, float thickness, float rounding) {
+    if (!std::isfinite(rounding) || rounding <= 0) {
+        AddLine(a, {b.x, a.y}, color, thickness);
+        AddLine({b.x, a.y}, b, color, thickness);
+        AddLine(b, {a.x, b.y}, color, thickness);
+        AddLine({a.x, b.y}, a, color, thickness);
+        return;
+    }
+    if (b.x <= a.x || b.y <= a.y)
+        return;
+    const float radius = std::min(rounding, std::min(b.x - a.x, b.y - a.y) * 0.5f);
+    const Point centers[] = {{b.x - radius, a.y + radius},
+                             {b.x - radius, b.y - radius},
+                             {a.x + radius, b.y - radius},
+                             {a.x + radius, a.y + radius}};
+    Point first{}, previous{};
+    for (int corner = 0; corner < 4; ++corner)
+        for (int i = 0; i <= 8; ++i) {
+            const float angle = (corner - 1 + i / 8.0f) * 1.570796327f;
+            Point point{centers[corner].x + std::cos(angle) * radius,
+                        centers[corner].y + std::sin(angle) * radius};
+            if (!corner && !i)
+                first = point;
+            else
+                AddLine(previous, point, color, thickness);
+            previous = point;
+        }
+    AddLine(previous, first, color, thickness);
+}
+void DrawList::AddCircleFilled(Point center, float radius, Color color) {
+    AddRectFilled({center.x - radius, center.y - radius}, {center.x + radius, center.y + radius}, color,
+                  radius);
 }
 void DrawList::AddLine(Point a, Point b, Color color, float thickness) {
     if (clips.empty() || !(color >> 24) || vertices.size() > 1000000 || !std::isfinite(a.x) ||
@@ -326,14 +407,53 @@ struct WindowState {
     Point position, size, cursor;
     Rect clip;
     float scroll = 0, content = 0, maxY = 0;
-    bool initialized = false, child = false;
+    bool initialized = false, child = false, popup = false;
     int flags = 0;
     float ScrollRange() const {
         return std::max(0.0f, std::floor(content - size.y));
     }
 };
+struct KeyEvent {
+    unsigned key = 0;
+    std::uint32_t character = 0;
+    bool control = false, shift = false;
+    std::string target;
+};
+struct FocusItem {
+    std::string key;
+    bool text = false;
+};
+struct EditSnapshot {
+    std::string value;
+    std::size_t cursor = 0, anchor = 0;
+};
+struct EditState {
+    std::string key, value;
+    std::size_t cursor = 0, anchor = 0;
+    float scroll = 0;
+    std::vector<EditSnapshot> undo, redo;
+};
+struct TableState {
+    Point origin;
+    float width = 0, row = 0, bottom = 0;
+    int columns = 0, column = -1, rowIndex = 0;
+    bool clipping = false;
+};
 struct Context {
     Input io;
+    Style style;
+    std::vector<KeyEvent> pendingKeys, keys;
+    std::vector<FocusItem> focusOrder;
+    std::string focused, itemKey, popupId, scrollFocus, wheelTarget;
+    std::vector<std::string> scrollOrder;
+    std::vector<TableState> tables;
+    Point popupPosition;
+    std::map<std::string, EditState> edits;
+    ClipboardRead clipboardRead = nullptr;
+    ClipboardWrite clipboardWrite = nullptr;
+    void *clipboardUser = nullptr;
+    unsigned highSurrogate = 0;
+    bool focusNext = false, itemDisabled = false;
     HWND window = nullptr;
     IDirect3DDevice9 *device = nullptr;
     Font font;
@@ -381,6 +501,9 @@ void DestroyContext(Context *state) {
 void SetCurrentContext(Context *state) {
     current = state;
 }
+Style &GetStyle() {
+    return current->style;
+}
 Input &GetIO() {
     assert(current);
     return current->io;
@@ -396,6 +519,13 @@ void ClearInput() {
         return;
     const bool release = current->io.MouseDown[0] && GetCapture() == current->window;
     current->active.clear();
+    current->focused.clear();
+    current->pendingKeys.clear();
+    current->keys.clear();
+    current->highSurrogate = 0;
+    current->focusNext = false;
+    current->io.WantCaptureKeyboard = current->io.WantTextInput = current->io.WantCaptureMouse = false;
+    std::fill(std::begin(current->io.KeysDown), std::end(current->io.KeysDown), false);
     for (auto &down : current->io.MouseDown)
         down = false;
     current->pendingDown = current->pendingUp = current->pendingDouble = false;
@@ -442,6 +572,32 @@ void Message(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
             state.releasingCapture = false;
         }
     }
+    if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wparam < 256) {
+        state.io.KeysDown[wparam] = true;
+        if (state.pendingKeys.size() < 4096)
+            state.pendingKeys.push_back({static_cast<unsigned>(wparam),
+                                         0,
+                                         state.io.KeysDown[VK_CONTROL],
+                                         state.io.KeysDown[VK_SHIFT],
+                                         {}});
+    }
+    if ((message == WM_KEYUP || message == WM_SYSKEYUP) && wparam < 256)
+        state.io.KeysDown[wparam] = false;
+    if (message == WM_CHAR || (message == WM_UNICHAR && wparam != UNICODE_NOCHAR)) {
+        std::uint32_t code = static_cast<std::uint32_t>(wparam);
+        if (message == WM_CHAR && code >= 0xd800 && code <= 0xdbff) {
+            state.highSurrogate = code;
+        } else {
+            if (message == WM_CHAR && code >= 0xdc00 && code <= 0xdfff) {
+                code = state.highSurrogate ? 0x10000 + ((state.highSurrogate - 0xd800) << 10) + code - 0xdc00
+                                           : 0xfffd;
+            } else if (state.highSurrogate && state.pendingKeys.size() < 4096)
+                state.pendingKeys.push_back({0, 0xfffd, false, false, {}});
+            state.highSurrogate = 0;
+            if (code >= 32 && code != 127 && state.pendingKeys.size() < 4096)
+                state.pendingKeys.push_back({0, code, false, false, {}});
+        }
+    }
     if (message == WM_MOUSEWHEEL)
         state.pendingWheel += static_cast<float>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
     if (message == WM_KILLFOCUS || message == WM_CANCELMODE ||
@@ -471,10 +627,59 @@ void NewFrame() {
             break;
         }
     }
+    state.wheelTarget.clear();
+    if (state.inputEnabled && state.wheel)
+        for (auto it = state.scrollOrder.rbegin(); it != state.scrollOrder.rend(); ++it) {
+            const auto &child = state.windows.at(*it);
+            if ((child.popup || child.root == state.hoveredRoot) && (state.popupId.empty() || child.popup) &&
+                Contains(child.clip, state.io.MousePos) &&
+                ((state.wheel > 0 && child.scroll > 0) ||
+                 (state.wheel < 0 && child.scroll < child.ScrollRange()))) {
+                state.wheelTarget = *it;
+                break;
+            }
+        }
+    state.scrollOrder.clear();
+    state.scrollFocus.clear();
+    state.keys = std::move(state.pendingKeys);
+    state.pendingKeys.clear();
+    if (state.down)
+        state.focused.clear();
+    for (auto &event : state.keys) {
+        if (event.key == VK_ESCAPE && !state.popupId.empty()) {
+            state.popupId.clear();
+            state.focused.clear();
+        }
+        if (event.key == VK_TAB && !state.focusOrder.empty()) {
+            auto found = std::find_if(state.focusOrder.begin(), state.focusOrder.end(),
+                                      [&](const FocusItem &item) { return item.key == state.focused; });
+            const auto count = static_cast<int>(state.focusOrder.size());
+            int index = found == state.focusOrder.end() ? (event.shift ? 0 : -1)
+                                                        : static_cast<int>(found - state.focusOrder.begin());
+            index = (index + (event.shift ? count - 1 : 1)) % count;
+            state.focused = state.focusOrder[index].key;
+            state.scrollFocus = state.focused;
+        }
+        event.target = state.focused;
+    }
+    state.focusOrder.clear();
+    state.io.WantTextInput = false;
+    state.io.WantCaptureKeyboard = !state.focused.empty();
+    state.io.WantCaptureMouse = !state.hoveredRoot.empty() || !state.active.empty() || !state.popupId.empty();
+    if (state.down && !state.popupId.empty()) {
+        const auto key = "w" + std::to_string(state.popupId.size()) + ":" + state.popupId;
+        const auto popup = state.windows.find(key);
+        if (popup != state.windows.end() && !Contains(popup->second.clip, state.io.MousePos)) {
+            state.popupId.clear();
+            state.down = false;
+            state.active.clear();
+        }
+    }
     state.order.clear();
     state.stack.clear();
     state.ids.clear();
     state.disabled.clear();
+    state.tables.clear();
     state.draw.Clear(state.io.DisplaySize);
     state.foreground.Clear(state.io.DisplaySize);
 }
@@ -496,6 +701,7 @@ bool Begin(const char *name, int flags) {
     window.root = key;
     window.flags = flags;
     window.child = false;
+    window.popup = !state.popupId.empty() && name == state.popupId;
     if (state.hasSize)
         window.size = state.nextSize;
     if (state.hasPos && (!state.firstOnly || !window.initialized))
@@ -509,11 +715,12 @@ bool Begin(const char *name, int flags) {
     state.hasSize = state.hasPos = false;
     state.order.push_back(key);
     state.stack.push_back(&window);
-    state.draw.PushClipRect(window.clip.min, window.clip.max);
+    GetWindowDrawList()->PushClipRect(window.clip.min, window.clip.max);
     return true;
 }
 void End() {
-    current->draw.PopClipRect();
+    if (!current->stack.empty())
+        GetWindowDrawList()->PopClipRect();
     if (!current->stack.empty())
         current->stack.pop_back();
 }
@@ -536,8 +743,8 @@ void SetWindowPos(Point pos) {
                                 ? current->stack[current->stack.size() - 2]->clip
                                 : Rect{{0, 0}, current->io.DisplaySize};
     window.clip = Intersection({pos, {pos.x + window.size.x, pos.y + window.size.y}}, parentClip);
-    current->draw.PopClipRect();
-    current->draw.PushClipRect(window.clip.min, window.clip.max);
+    GetWindowDrawList()->PopClipRect();
+    GetWindowDrawList()->PushClipRect(window.clip.min, window.clip.max);
 }
 bool IsWindowHovered() {
     const auto &window = Window();
@@ -549,7 +756,7 @@ bool IsMouseHoveringRect(Point a, Point b) {
     return Contains({a, b}, current->io.MousePos);
 }
 DrawList *GetWindowDrawList() {
-    return &current->draw;
+    return !current->stack.empty() && Window().popup ? &current->foreground : &current->draw;
 }
 DrawList *GetForegroundDrawList() {
     return &current->foreground;
@@ -592,15 +799,42 @@ bool InvisibleButton(const char *label, Point size) {
     for (const auto &id : state.ids)
         key += std::to_string(id.size()) + ":" + id;
     key += std::to_string(std::strlen(label)) + ":" + label;
-    const bool disabled = !state.disabled.empty() && state.disabled.back();
+    state.itemKey = key;
+    const bool disabled = (!state.disabled.empty() && state.disabled.back()) || !state.inputEnabled ||
+                          (window.flags & NoInputs) || (!state.popupId.empty() && !window.popup);
+    state.itemDisabled = disabled;
+    if (!disabled && std::isfinite(size.x) && std::isfinite(size.y) && size.x > 0 && size.y > 0) {
+        state.focusOrder.push_back({key, false});
+        if (state.focusNext) {
+            state.focused = key;
+            state.scrollFocus = key;
+            state.focusNext = false;
+        }
+    }
     state.itemHovered = !disabled && IsWindowHovered() && Contains({a, b}, state.io.MousePos);
     state.itemActivated = false;
     if (state.down && state.itemHovered && (state.active.empty() || state.active == key)) {
         state.active = key;
+        state.focused = key;
         state.itemActivated = true;
     }
     state.itemActive = !disabled && state.inputEnabled && state.active == key && state.io.MouseDown[0];
-    const bool clicked = state.up && state.active == key && state.itemHovered;
+    bool clicked = state.up && state.active == key && state.itemHovered;
+    if (!disabled) {
+        for (const auto &event : state.keys)
+            if ((event.target == key || (event.target.empty() && state.focused == key)) &&
+                (event.key == VK_RETURN || event.key == VK_SPACE))
+                clicked = true;
+    }
+    if (!disabled && state.focused == key) {
+        state.io.WantCaptureKeyboard = true;
+        if (window.child && state.scrollFocus == key) {
+            if (a.y < window.clip.min.y)
+                window.scroll = std::max(0.0f, window.scroll - (window.clip.min.y - a.y));
+            else if (b.y > window.clip.max.y)
+                window.scroll = std::min(window.ScrollRange(), window.scroll + b.y - window.clip.max.y);
+        }
+    }
     if (state.up && state.active == key)
         state.active.clear();
     window.cursor.y = b.y;
@@ -628,6 +862,7 @@ bool IsMouseDragging(int button, float threshold) {
 }
 void Dummy(Point size) {
     auto &w = Window();
+    current->item = {w.cursor, {w.cursor.x + size.x, w.cursor.y + size.y}};
     w.cursor.y += size.y;
     w.maxY = std::max(w.maxY, w.cursor.y + w.scroll - w.position.y);
 }
@@ -642,6 +877,7 @@ bool BeginChild(const char *label, Point size, int flags) {
     child.key = key;
     child.root = parent.root;
     child.child = true;
+    child.popup = parent.popup;
     child.initialized = true;
     child.position = parent.cursor;
     child.size = size;
@@ -649,14 +885,17 @@ bool BeginChild(const char *label, Point size, int flags) {
     child.clip =
         Intersection({child.position, {child.position.x + size.x, child.position.y + size.y}}, parent.clip);
     const float maxScroll = child.ScrollRange();
-    const bool disabled = !state.disabled.empty() && state.disabled.back();
-    if (!disabled && IsWindowHovered() && Contains(child.clip, state.io.MousePos))
+    const bool disabled =
+        (!state.disabled.empty() && state.disabled.back()) || !state.inputEnabled || (child.flags & NoInputs);
+    if (!disabled)
+        state.scrollOrder.push_back(key);
+    if (!disabled && state.wheelTarget == key && IsWindowHovered() && Contains(child.clip, state.io.MousePos))
         child.scroll = std::clamp(child.scroll - state.wheel * 42.0f, 0.0f, maxScroll);
     child.scroll = std::clamp(child.scroll, 0.0f, maxScroll);
     child.maxY = 0;
     child.cursor = {child.position.x, child.position.y - child.scroll};
     state.stack.push_back(&child);
-    state.draw.PushClipRect(child.clip.min, child.clip.max);
+    GetWindowDrawList()->PushClipRect(child.clip.min, child.clip.max);
     return true;
 }
 void EndChild() {
@@ -671,21 +910,427 @@ void EndChild() {
         const Point top(child.position.x + child.size.x - width, child.position.y);
         const float travel = child.size.y - height;
         float y = top.y + travel * child.scroll / range;
-        state.draw.AddRectFilled(top, {top.x + width, top.y + child.size.y}, RGBA(26, 32, 43, 255));
+        GetWindowDrawList()->AddRectFilled(top, {top.x + width, top.y + child.size.y}, state.style.Field);
         child.cursor = {top.x, y};
         InvisibleButton("##scroll", {width, height});
         if (IsItemActive() && travel > 0) {
             child.scroll = std::clamp(child.scroll + state.io.MouseDelta.y * range / travel, 0.0f, range);
             y = top.y + travel * child.scroll / range;
         }
-        state.draw.AddRectFilled({top.x, y}, {top.x + width, y + height},
-                                 IsItemActive()    ? RGBA(96, 174, 250, 255)
-                                 : IsItemHovered() ? RGBA(74, 130, 194, 255)
-                                                   : RGBA(54, 76, 100, 255));
+        GetWindowDrawList()->AddRectFilled({top.x, y}, {top.x + width, y + height},
+                                           IsItemActive()    ? state.style.Accent
+                                           : IsItemHovered() ? state.style.Muted
+                                                             : state.style.Border);
     }
     const auto bottom = Point(child.position.x, child.position.y + child.size.y);
     End();
     Window().cursor = bottom;
+    Dummy({0, 0});
+}
+
+bool IsItemFocused() {
+    return !current->itemDisabled && current->focused == current->itemKey;
+}
+void SetKeyboardFocusHere() {
+    current->focusNext = true;
+}
+bool IsKeyPressed(unsigned key) {
+    return current->inputEnabled && !current->itemDisabled &&
+           std::any_of(current->keys.begin(), current->keys.end(), [&](const KeyEvent &event) {
+               return event.key == key && (event.target == current->itemKey ||
+                                           (event.target.empty() && current->focused == current->itemKey));
+           });
+}
+void SetClipboardHandlers(ClipboardRead read, ClipboardWrite write, void *user) {
+    current->clipboardRead = read;
+    current->clipboardWrite = write;
+    current->clipboardUser = user;
+}
+static std::string Encode(std::uint32_t code) {
+    if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff))
+        code = 0xfffd;
+    std::string result;
+    if (code < 0x80)
+        result += static_cast<char>(code);
+    else {
+        if (code < 0x800)
+            result += static_cast<char>(0xc0 | (code >> 6));
+        else {
+            if (code < 0x10000)
+                result += static_cast<char>(0xe0 | (code >> 12));
+            else {
+                result += static_cast<char>(0xf0 | (code >> 18));
+                result += static_cast<char>(0x80 | ((code >> 12) & 63));
+            }
+            result += static_cast<char>(0x80 | ((code >> 6) & 63));
+        }
+        result += static_cast<char>(0x80 | (code & 63));
+    }
+    return result;
+}
+static std::string CleanText(const std::string &value, std::size_t limit) {
+    std::string result;
+    const char *at = value.c_str();
+    while (*at && result.size() < limit) {
+        const auto code = NextCodepoint(at);
+        if (code < 32 || code == 127)
+            continue;
+        const auto encoded = Encode(code);
+        if (encoded.size() > limit - result.size())
+            break;
+        result += encoded;
+    }
+    return result;
+}
+static std::size_t Previous(const std::string &value, std::size_t at) {
+    if (at)
+        --at;
+    while (at && (static_cast<unsigned char>(value[at]) & 0xc0) == 0x80)
+        --at;
+    return at;
+}
+static std::size_t Next(const std::string &value, std::size_t at) {
+    if (at >= value.size())
+        return value.size();
+    const char *start = value.c_str(), *point = start + at;
+    NextCodepoint(point);
+    return static_cast<std::size_t>(point - start);
+}
+static bool ReadClipboard(std::string &value) {
+    auto &state = *current;
+    if (state.clipboardRead)
+        return state.clipboardRead(value, state.clipboardUser);
+    if (!state.window || !OpenClipboard(state.window))
+        return false;
+    bool success = false;
+    const auto handle = GetClipboardData(CF_UNICODETEXT);
+    const auto size = handle ? GlobalSize(handle) / sizeof(wchar_t) : 0;
+    if (size > 0 && size <= 1048576) {
+        const auto *text = static_cast<const wchar_t *>(GlobalLock(handle));
+        if (text) {
+            std::size_t length = 0;
+            while (length < size && text[length])
+                ++length;
+            if (length < size) {
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), nullptr, 0,
+                                                      nullptr, nullptr);
+                value.resize(bytes);
+                success = !length || WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length),
+                                                         value.data(), bytes, nullptr, nullptr) == bytes;
+            }
+            GlobalUnlock(handle);
+        }
+    }
+    CloseClipboard();
+    return success;
+}
+static bool WriteClipboard(const std::string &value) {
+    auto &state = *current;
+    if (state.clipboardWrite)
+        return state.clipboardWrite(value, state.clipboardUser);
+    if (!state.window || value.size() > 1048576)
+        return false;
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, nullptr, 0);
+    if (length <= 0)
+        return false;
+    auto memory = GlobalAlloc(GMEM_MOVEABLE, static_cast<SIZE_T>(length) * sizeof(wchar_t));
+    if (!memory)
+        return false;
+    auto *text = static_cast<wchar_t *>(GlobalLock(memory));
+    if (!text) {
+        GlobalFree(memory);
+        return false;
+    }
+    const bool converted =
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.c_str(), -1, text, length) == length;
+    GlobalUnlock(memory);
+    bool success = false;
+    if (converted && OpenClipboard(state.window)) {
+        success = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, memory);
+        CloseClipboard();
+    }
+    if (!success)
+        GlobalFree(memory);
+    return success;
+}
+static void Remember(std::vector<EditSnapshot> &history, const EditState &edit, const std::string &value) {
+    std::size_t bytes = value.size();
+    for (const auto &snapshot : history)
+        bytes += snapshot.value.size();
+    while (!history.empty() && (history.size() >= 64 || bytes > 1048576)) {
+        bytes -= history.front().value.size();
+        history.erase(history.begin());
+    }
+    history.push_back({value, edit.cursor, edit.anchor});
+}
+bool InputText(const char *id, std::string &value, float width, std::size_t max_bytes, int flags) {
+    if (!id || !std::isfinite(width) || width < 40 || value.size() > 1048576 || max_bytes > 1048576)
+        return false;
+    auto &state = *current;
+    auto &style = state.style;
+    const auto position = GetCursorScreenPos();
+    const float labelHeight = style.FontSize + 6, height = style.FontSize + 16;
+    InvisibleButton(id, {width, labelHeight + height});
+    const bool focused = IsItemFocused();
+    const bool readOnly = (flags & TextReadOnly) != 0, password = (flags & TextPassword) != 0;
+    bool changed = false, submitted = false;
+    auto &edit = state.edits[state.itemKey];
+    const bool receives =
+        !state.itemDisabled &&
+        (focused || std::any_of(state.keys.begin(), state.keys.end(), [&](const KeyEvent &event) {
+             return !event.target.empty() && event.target == state.itemKey;
+         }));
+    if (receives) {
+        if (edit.key != state.itemKey || edit.value != value) {
+            edit = {};
+            edit.key = state.itemKey;
+            edit.cursor = edit.anchor = value.size();
+            edit.value = value;
+        }
+        if (!state.focusOrder.empty())
+            state.focusOrder.back().text = true;
+        if (focused)
+            state.io.WantTextInput = !readOnly;
+    }
+    const auto display = [&](std::size_t end) {
+        if (!password)
+            return value.substr(0, end);
+        std::string masked;
+        for (std::size_t at = 0; at < end; at = Next(value, at))
+            masked += '*';
+        return masked;
+    };
+    const auto measure = [&](std::size_t end) {
+        return state.font.MeasureText(display(end).c_str(), style.FontSize).x;
+    };
+    const auto mouseCursor = [&] {
+        const float x = state.io.MousePos.x - position.x - 8 + edit.scroll;
+        float previous = 0;
+        for (std::size_t at = 0; at < value.size();) {
+            const auto next = Next(value, at);
+            const auto character = password ? std::string("*") : value.substr(at, next - at);
+            const float nextX = previous + state.font.MeasureText(character.c_str(), style.FontSize).x;
+            if (x < (previous + nextX) * 0.5f)
+                return at;
+            previous = nextX;
+            at = next;
+        }
+        return value.size();
+    };
+    if (focused && IsItemActivated()) {
+        edit.cursor = mouseCursor();
+        if (!state.io.KeysDown[VK_SHIFT])
+            edit.anchor = edit.cursor;
+    }
+    if (focused && IsItemActive())
+        edit.cursor = mouseCursor();
+    if (focused && IsItemHovered() && IsMouseDoubleClicked(0)) {
+        edit.anchor = 0;
+        edit.cursor = value.size();
+    }
+    const auto replace = [&](const std::string &insertion) {
+        if (readOnly)
+            return;
+        const auto lo = std::min(edit.cursor, edit.anchor), hi = std::max(edit.cursor, edit.anchor);
+        const auto kept = value.size() - (hi - lo);
+        const auto clean = CleanText(insertion, max_bytes > kept ? max_bytes - kept : 0);
+        if (lo == hi && clean.empty())
+            return;
+        Remember(edit.undo, edit, value);
+        edit.redo.clear();
+        value.replace(lo, hi - lo, clean);
+        edit.cursor = edit.anchor = lo + clean.size();
+        changed = true;
+    };
+    if (receives)
+        for (const auto &event : state.keys) {
+            if (!event.target.empty() && event.target != state.itemKey)
+                continue;
+            if (event.character) {
+                replace(Encode(event.character));
+                continue;
+            }
+            if (event.key == VK_RETURN)
+                submitted = true;
+            if (event.control && event.key == 'A') {
+                edit.anchor = 0;
+                edit.cursor = value.size();
+            } else if (event.control && (event.key == 'C' || event.key == 'X')) {
+                const auto lo = std::min(edit.cursor, edit.anchor), hi = std::max(edit.cursor, edit.anchor);
+                if (!password && lo != hi && WriteClipboard(value.substr(lo, hi - lo)) && event.key == 'X')
+                    replace({});
+            } else if (event.control && event.key == 'V' && !readOnly) {
+                std::string pasted;
+                if (ReadClipboard(pasted) && pasted.size() <= 1048576)
+                    replace(pasted);
+            } else if (event.control && (event.key == 'Z' || event.key == 'Y') && !readOnly) {
+                auto &from = event.key == 'Y' || event.shift ? edit.redo : edit.undo;
+                auto &to = &from == &edit.redo ? edit.undo : edit.redo;
+                if (!from.empty()) {
+                    Remember(to, edit, value);
+                    auto saved = std::move(from.back());
+                    from.pop_back();
+                    value = std::move(saved.value);
+                    edit.cursor = saved.cursor;
+                    edit.anchor = saved.anchor;
+                    changed = true;
+                }
+            } else if ((event.key == VK_BACK || event.key == VK_DELETE) && !readOnly) {
+                if (edit.cursor == edit.anchor) {
+                    if (event.key == VK_BACK)
+                        edit.anchor = Previous(value, edit.cursor);
+                    else
+                        edit.anchor = Next(value, edit.cursor);
+                }
+                replace({});
+            } else if (event.key == VK_LEFT || event.key == VK_RIGHT || event.key == VK_HOME ||
+                       event.key == VK_END) {
+                if (event.key == VK_HOME)
+                    edit.cursor = 0;
+                else if (event.key == VK_END)
+                    edit.cursor = value.size();
+                else if (!event.shift && edit.cursor != edit.anchor)
+                    edit.cursor = event.key == VK_LEFT ? std::min(edit.cursor, edit.anchor)
+                                                       : std::max(edit.cursor, edit.anchor);
+                else {
+                    edit.cursor =
+                        event.key == VK_LEFT ? Previous(value, edit.cursor) : Next(value, edit.cursor);
+                    if (event.control)
+                        while (edit.cursor > 0 && edit.cursor < value.size() && value[edit.cursor] != ' ')
+                            edit.cursor = event.key == VK_LEFT ? Previous(value, edit.cursor)
+                                                               : Next(value, edit.cursor);
+                }
+                if (!event.shift)
+                    edit.anchor = edit.cursor;
+            }
+        }
+    if (receives) {
+        edit.value = value;
+        const float caret = measure(edit.cursor), available = width - 16;
+        edit.scroll = std::clamp(edit.scroll, std::max(0.0f, caret - available), caret);
+    }
+    auto *draw = GetWindowDrawList();
+    const Point top{position.x, position.y + labelHeight}, bottom{position.x + width, top.y + height};
+    draw->AddText(GetFont(), style.FontSize, position, style.Text, id);
+    draw->AddRectFilled(top, bottom, style.Field, style.Rounding);
+    draw->AddRect(top, bottom, focused ? style.Accent : style.Border, 1, style.Rounding);
+    draw->PushClipRect({top.x + 7, top.y}, {bottom.x - 7, bottom.y});
+    const float scroll = focused ? edit.scroll : 0;
+    if (focused && edit.cursor != edit.anchor) {
+        const float first = measure(std::min(edit.cursor, edit.anchor)),
+                    last = measure(std::max(edit.cursor, edit.anchor));
+        draw->AddRectFilled({top.x + 8 + first - scroll, top.y + 5},
+                            {top.x + 8 + last - scroll, bottom.y - 5}, style.Selection);
+    }
+    const auto text = display(value.size());
+    draw->AddText(GetFont(), style.FontSize, {top.x + 8 - scroll, top.y + 8},
+                  state.itemDisabled ? style.Muted : style.Text, text.c_str());
+    if (focused && (GetTickCount64() % 1000 < 650 || changed)) {
+        const float caret = top.x + 8 + measure(edit.cursor) - scroll;
+        draw->AddLine({caret, top.y + 5}, {caret, bottom.y - 5}, style.Accent);
+    }
+    draw->PopClipRect();
+    return flags & TextEnterReturnsTrue ? submitted : changed;
+}
+void SameLine(float spacing) {
+    auto &window = Window();
+    const auto item = current->item;
+    window.cursor = {item.max.x + (spacing < 0 ? current->style.Spacing : spacing), item.min.y};
+}
+void Spacing(float height) {
+    Dummy({0, height < 0 ? current->style.Spacing : height});
+}
+void Separator(float width) {
+    const auto position = GetCursorScreenPos();
+    if (width <= 0)
+        width = Window().position.x + Window().size.x - position.x;
+    GetWindowDrawList()->AddLine(position, {position.x + width, position.y}, current->style.Border);
+    Dummy({0, current->style.Spacing});
+}
+bool BeginTable(const char *id, int columns, float width) {
+    if (!id || columns < 1 || columns > 64 || !std::isfinite(width))
+        return false;
+    const auto origin = GetCursorScreenPos();
+    if (width <= 0)
+        width = Window().position.x + Window().size.x - origin.x;
+    if (width <= 0)
+        return false;
+    PushID(id);
+    current->tables.push_back({origin, width, origin.y, origin.y, columns, -1, 0, false});
+    return true;
+}
+void TableNextColumn() {
+    assert(!current->tables.empty());
+    auto &table = current->tables.back();
+    if (table.clipping) {
+        table.bottom = std::max(table.bottom, GetCursorScreenPos().y);
+        GetWindowDrawList()->PopClipRect();
+        PopID();
+    }
+    if (++table.column == table.columns) {
+        table.column = 0;
+        ++table.rowIndex;
+        table.row = table.bottom + current->style.Spacing;
+    }
+    const float width = table.width / table.columns;
+    const float left = table.origin.x + width * table.column;
+    SetCursorScreenPos({left, table.row});
+    GetWindowDrawList()->PushClipRect({left, table.row},
+                                      {left + width - current->style.Spacing, Window().clip.max.y});
+    PushID(table.rowIndex * table.columns + table.column);
+    table.clipping = true;
+}
+void EndTable() {
+    assert(!current->tables.empty());
+    auto table = current->tables.back();
+    current->tables.pop_back();
+    if (table.clipping) {
+        table.bottom = std::max(table.bottom, GetCursorScreenPos().y);
+        GetWindowDrawList()->PopClipRect();
+        PopID();
+    }
+    PopID();
+    SetCursorScreenPos({table.origin.x, table.bottom});
+    Dummy({0, 0});
+}
+static std::string PopupName(const char *id) {
+    std::string key = "popup:" + Window().key;
+    for (const auto &part : current->ids)
+        key += std::to_string(part.size()) + ":" + part;
+    return key + ":" + id;
+}
+void OpenPopup(const char *id) {
+    if (!id)
+        return;
+    current->popupId = PopupName(id);
+    current->popupPosition = {current->item.min.x, current->item.max.y + 4};
+    current->focused.clear();
+}
+bool BeginPopup(const char *id, Point size) {
+    const auto name = PopupName(id);
+    if (current->popupId != name)
+        return false;
+    const auto screen = GetIO().DisplaySize;
+    size.x = std::min(size.x, screen.x);
+    size.y = std::min(size.y, screen.y);
+    const Point position{std::clamp(current->popupPosition.x, 0.0f, std::max(0.0f, screen.x - size.x)),
+                         std::clamp(current->popupPosition.y, 0.0f, std::max(0.0f, screen.y - size.y))};
+    SetNextWindowPos(position);
+    SetNextWindowSize(size);
+    Begin(name.c_str());
+    GetWindowDrawList()->AddRectFilled(position, {position.x + size.x, position.y + size.y},
+                                       current->style.Background, current->style.Rounding);
+    GetWindowDrawList()->AddRect(position, {position.x + size.x, position.y + size.y}, current->style.Border,
+                                 1, current->style.Rounding);
+    current->hoveredRoot = Window().key;
+    return true;
+}
+void EndPopup() {
+    End();
+}
+void CloseCurrentPopup() {
+    current->popupId.clear();
+    current->focused.clear();
 }
 
 void Flush() {
@@ -783,6 +1428,19 @@ void EndFrame() {
     auto &state = *current;
     if (state.up)
         state.active.clear();
+    if (std::none_of(state.focusOrder.begin(), state.focusOrder.end(),
+                     [&](const FocusItem &item) { return item.key == state.focused; })) {
+        state.focused.clear();
+        state.io.WantCaptureKeyboard = state.io.WantTextInput = false;
+    }
+    for (auto it = state.edits.begin(); it != state.edits.end();) {
+        if (std::none_of(state.focusOrder.begin(), state.focusOrder.end(),
+                         [&](const FocusItem &item) { return item.key == it->first; }))
+            it = state.edits.erase(it);
+        else
+            ++it;
+    }
+    state.keys.clear();
 }
 void Render() {
     Flush();
