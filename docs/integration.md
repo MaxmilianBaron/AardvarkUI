@@ -102,4 +102,8 @@ No network access or file writes are performed by the library. The renderer uses
 
 ## Verification
 
+The renderer bounds each draw to the device's primitive limit and rejects non-finite or empty clip rectangles before integer conversion. It restores stream bindings, instancing frequency, viewport, scissor and captured D3D9 state. Transparent render targets use source-over alpha when the adapter supports separate alpha blending; adapters without that capability retain RGB blending only. Clearing a transparent target to zero produces premultiplied output, so composite that target with `ONE` / `INVSRCALPHA`.
+
+Configure with `-DAARDVARKUI_BUILD_RENDER_TESTS=ON` to add local D3D9 readback tests for alpha layers, textured clipping, font output, host state restoration and drawing after device reset. These require a local adapter with separate alpha blending and are separate from the default headless CI tests.
+
 CTest runs input, editing, focus, popup, nested scrolling, geometry and virtualized table contracts without a graphics device. The demo's `--snapshot <file.png>` mode exercises real window messages for editing, undo/redo, combo selection, filtering, sorting, column resizing and navigation to the last record. It checks restored render state, resets the device and saves the rendered result. `--snapshot-menu <file.png>` leaves the menu open; `--snapshot-dark <file.png>` renders the dark palette. Snapshot modes require a working local D3D9 adapter and fail if a lost device cannot recover within three seconds. CI runs Debug/Release contracts and builds a separate consumer from the installed package on x86 and x64.

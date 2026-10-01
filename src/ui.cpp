@@ -1,3 +1,4 @@
+#include "render_plan.hpp"
 #include <aardvark/ui.hpp>
 #include <algorithm>
 #include <array>
@@ -465,6 +466,7 @@ struct Context {
     bool focusNext = false, itemDisabled = false;
     HWND window = nullptr;
     IDirect3DDevice9 *device = nullptr;
+    D3DCAPS9 caps{};
     Font font;
     DrawList draw, foreground;
     std::map<std::string, WindowState> windows;
@@ -494,8 +496,10 @@ Context *CreateContext(HWND window, IDirect3DDevice9 *device) {
     auto state = std::make_unique<Context>();
     state->window = window;
     state->device = device;
-    if (device)
+    if (device) {
         device->AddRef();
+        device->GetDeviceCaps(&state->caps);
+    }
     return state.release();
 }
 void DestroyContext(Context *state) {
@@ -1422,8 +1426,6 @@ void CloseCurrentPopup() {
 void Flush() {
     auto &state = *current;
     auto *device = state.device;
-    if (!device || (state.draw.commands.empty() && state.foreground.commands.empty()))
-        return;
     struct ClearDraw {
         Context &state;
         ~ClearDraw() {
@@ -1431,21 +1433,31 @@ void Flush() {
             state.foreground.Clear(state.io.DisplaySize);
         }
     } clear{state};
+    DWORD width = 0, height = 0;
+    if (!device || (state.draw.commands.empty() && state.foreground.commands.empty()) ||
+        !state.caps.MaxPrimitiveCount || !detail::viewport_size(state.io.DisplaySize, width, height))
+        return;
     IDirect3DStateBlock9 *saved = nullptr;
     IDirect3DVertexBuffer9 *stream = nullptr;
-    UINT offset = 0, stride = 0;
+    UINT offset = 0, stride = 0, frequency = 1;
     if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &saved)))
         return;
     if (FAILED(saved->Capture())) {
         saved->Release();
         return;
     }
-    device->GetStreamSource(0, &stream, &offset, &stride);
+    if (FAILED(device->GetStreamSource(0, &stream, &offset, &stride)) ||
+        FAILED(device->GetStreamSourceFreq(0, &frequency))) {
+        if (stream)
+            stream->Release();
+        saved->Release();
+        return;
+    }
     device->SetVertexShader(nullptr);
     device->SetPixelShader(nullptr);
-    const D3DVIEWPORT9 viewport{
-        0, 0, static_cast<DWORD>(state.io.DisplaySize.x), static_cast<DWORD>(state.io.DisplaySize.y), 0, 1};
+    const D3DVIEWPORT9 viewport{0, 0, width, height, 0, 1};
     device->SetViewport(&viewport);
+    device->SetStreamSourceFreq(0, 1);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
@@ -1462,16 +1474,25 @@ void Flush() {
     device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
     device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     device->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
-    device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    if (state.caps.PrimitiveMiscCaps & D3DPMISCCAPS_SEPARATEALPHABLEND) {
+        device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+        device->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+        device->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+        device->SetRenderState(D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
+    } else {
+        device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    }
     device->SetRenderState(D3DRS_SCISSORTESTENABLE, TRUE);
     device->SetRenderState(D3DRS_COLORWRITEENABLE, 15);
     device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_MULTISAMPLEMASK, 0xffffffffu);
     device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
     device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
     device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
     device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_RESULTARG, D3DTA_CURRENT);
     device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
     device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
@@ -1485,11 +1506,8 @@ void Flush() {
             if (command.first > draw->vertices.size() ||
                 command.count > draw->vertices.size() - command.first || command.count % 3)
                 continue;
-            RECT clip{static_cast<LONG>(std::max(0.0f, command.clip.min.x)),
-                      static_cast<LONG>(std::max(0.0f, command.clip.min.y)),
-                      static_cast<LONG>(std::min(state.io.DisplaySize.x, command.clip.max.x)),
-                      static_cast<LONG>(std::min(state.io.DisplaySize.y, command.clip.max.y))};
-            if (clip.left >= clip.right || clip.top >= clip.bottom)
+            RECT clip{};
+            if (!detail::scissor(command.clip, width, height, clip))
                 continue;
             device->SetScissorRect(&clip);
             device->SetTexture(0, command.texture);
@@ -1498,7 +1516,7 @@ void Flush() {
             device->SetTextureStageState(0, D3DTSS_ALPHAOP,
                                          command.texture ? D3DTOP_MODULATE : D3DTOP_SELECTARG2);
             for (size_t at = 0; at < command.count;) {
-                const UINT count = static_cast<UINT>(std::min<size_t>(command.count - at, 180000));
+                const UINT count = detail::vertex_batch(command.count - at, state.caps.MaxPrimitiveCount);
                 device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, count / 3,
                                         draw->vertices.data() + command.first + at, sizeof(Vertex));
                 at += count;
@@ -1506,6 +1524,7 @@ void Flush() {
         }
     saved->Apply();
     device->SetStreamSource(0, stream, offset, stride);
+    device->SetStreamSourceFreq(0, frequency);
     if (stream)
         stream->Release();
     saved->Release();

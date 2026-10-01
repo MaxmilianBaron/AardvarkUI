@@ -120,7 +120,7 @@ static void contents(bool snapshot) {
     label(123, 77, "A compact toolkit for native interfaces.", 15, style.Muted);
     draw->AddRectFilled({screen.x - 154, 45}, {screen.x - 32, 77}, style.Selection, 16);
     draw->AddCircleFilled({screen.x - 136, 61}, 4, style.Accent);
-    label(screen.x - 123, 53, "v0.3.0", 16, style.Accent);
+    label(screen.x - 123, 53, "v0.3.1", 16, style.Accent);
     ui::SetCursorScreenPos({screen.x - 274, 45});
     if (ui::Button(dark ? "Light" : "Dark", {100, 32}))
         dark = !dark;

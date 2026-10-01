@@ -1,3 +1,4 @@
+#include "../src/render_plan.hpp"
 #include <aardvark/ui.hpp>
 #include <cmath>
 #include <cstdio>
@@ -426,7 +427,55 @@ static void popup_editor() {
     ui::DestroyContext(context);
 }
 
+static void render_limits() {
+    DWORD width = 0, height = 0;
+    const auto nan = std::numeric_limits<float>::quiet_NaN();
+    const auto infinity = std::numeric_limits<float>::infinity();
+    const auto largest = std::numeric_limits<float>::max();
+    CHECK(ui::detail::viewport_size({640.8f, 480.4f}, width, height));
+    CHECK(width == 640 && height == 480);
+    for (auto bad : {nan, infinity, -infinity, largest, -1.0f, 0.0f, 0.5f, 2147483648.0f}) {
+        CHECK(!ui::detail::viewport_size({bad, 480}, width, height));
+        CHECK(!ui::detail::viewport_size({640, bad}, width, height));
+    }
+    RECT clip{};
+    CHECK(ui::detail::scissor({{-largest, -largest}, {largest, largest}}, 640, 480, clip));
+    CHECK(clip.left == 0 && clip.top == 0 && clip.right == 640 && clip.bottom == 480);
+    CHECK(!ui::detail::scissor({{700, 0}, {largest, 480}}, 640, 480, clip));
+    CHECK(!ui::detail::scissor({{100, 0}, {99, 480}}, 640, 480, clip));
+    CHECK(!ui::detail::scissor({{0, 0}, {1, 1}}, 0, 480, clip));
+    CHECK(!ui::detail::scissor({{0, 0}, {1, 1}}, 0xffffffffu, 480, clip));
+    for (auto bad : {nan, infinity, -infinity}) {
+        CHECK(!ui::detail::scissor({{bad, 0}, {640, 480}}, 640, 480, clip));
+        CHECK(!ui::detail::scissor({{0, bad}, {640, 480}}, 640, 480, clip));
+        CHECK(!ui::detail::scissor({{0, 0}, {bad, 480}}, 640, 480, clip));
+        CHECK(!ui::detail::scissor({{0, 0}, {640, bad}}, 640, 480, clip));
+    }
+    CHECK(ui::detail::vertex_batch(180003, 1) == 3);
+    CHECK(ui::detail::vertex_batch(180003, 65535) == 180000);
+    CHECK(ui::detail::vertex_batch(8, 65535) == 6);
+    CHECK(ui::detail::vertex_batch(2, 65535) == 0);
+    CHECK(ui::detail::vertex_batch(std::numeric_limits<std::size_t>::max(), 0xffffffffu) == 180000);
+    CHECK(ui::detail::vertex_batch(6, 0) == 0);
+    auto *context = ui::CreateContext();
+    ui::SetCurrentContext(context);
+    ui::GetIO().DisplaySize = {640, 480};
+    frame_begin();
+    auto *draw = ui::GetWindowDrawList();
+    auto *overlay = ui::GetForegroundDrawList();
+    draw->AddRectFilled({0, 0}, {10, 10}, ui::White);
+    overlay->AddRectFilled({0, 0}, {10, 10}, ui::White);
+    CHECK(!draw->commands.empty() && !overlay->commands.empty());
+    ui::End();
+    ui::Flush();
+    CHECK(draw->commands.empty() && draw->vertices.empty());
+    CHECK(overlay->commands.empty() && overlay->vertices.empty());
+    ui::EndFrame();
+    ui::DestroyContext(context);
+}
+
 int main() {
+    render_limits();
     geometry();
     input();
     editing();

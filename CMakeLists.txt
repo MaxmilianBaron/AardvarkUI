@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(AardvarkUI VERSION 0.3.0 LANGUAGES CXX)
+project(AardvarkUI VERSION 0.3.1 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "AardvarkUI requires Windows and Direct3D 9.")
@@ -7,6 +7,7 @@ endif()
 
 option(AARDVARKUI_BUILD_EXAMPLES "Build the interactive demo" ${PROJECT_IS_TOP_LEVEL})
 option(AARDVARKUI_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})
+option(AARDVARKUI_BUILD_RENDER_TESTS "Build tests requiring a local Direct3D 9 adapter" OFF)
 
 add_library(AardvarkUI STATIC src/ui.cpp src/widgets.cpp src/data_table.cpp)
 add_library(AardvarkUI::AardvarkUI ALIAS AardvarkUI)
@@ -33,6 +34,11 @@ if(AARDVARKUI_BUILD_TESTS)
     add_executable(aardvark_table_tests tests/table_tests.cpp)
     target_link_libraries(aardvark_table_tests PRIVATE AardvarkUI)
     add_test(NAME table_contracts COMMAND aardvark_table_tests)
+    if(AARDVARKUI_BUILD_RENDER_TESTS)
+        add_executable(aardvark_renderer_tests tests/renderer_tests.cpp)
+        target_link_libraries(aardvark_renderer_tests PRIVATE AardvarkUI)
+        add_test(NAME renderer_contracts COMMAND aardvark_renderer_tests)
+    endif()
 endif()
 
 include(GNUInstallDirs)

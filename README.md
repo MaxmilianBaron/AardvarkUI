@@ -2,7 +2,7 @@
 
 C++17 immediate-mode UI for **Win32 and Direct3D 9, x86 and x64**. MIT licensed.
 
-UTF-8 editing, clipboard, undo, keyboard navigation, popups and scrolling. Virtualized data tables support row selection, sortable headers and resizable columns. Draw lists batch clipped geometry, images and text.
+UTF-8 editing, clipboard, undo, keyboard navigation, popups and scrolling. Virtualized data tables support row selection, sortable headers and resizable columns. Draw lists batch clipped geometry, images and text while preserving the host's graphics state.
 
 ![AardvarkUI demo](docs/demo.png)
 
